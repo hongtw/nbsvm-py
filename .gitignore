@@ -1,4 +1,7 @@
 env
 .ipynb_checkpoints
 *egg*
-*.pyc
+*.
+.vscode
+build
+__pycache__
