@@ -1,4 +1,4 @@
-# https://www.kaggle.com/jhoward/nb-svm-strong-linear-baseline
+# https://www.kaggle.com/jhoward/nb-svm-strong-linear-
 import os
 import gc
 import sys
@@ -6,12 +6,14 @@ import time
 import pickle
 import hashlib
 import traceback
-import numpy as np
+import logging
+import logging.config
 from scipy import sparse
 from datetime import datetime
-from sklearn.externals import joblib
+import joblib
+import numpy as np
 from sklearn.base import BaseEstimator, ClassifierMixin
-from sklearn.externals.joblib import Parallel, delayed
+from joblib import Parallel, delayed
 from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import train_test_split
 from scipy.sparse import isspmatrix_csc, isspmatrix_csr
@@ -20,22 +22,6 @@ from sklearn.utils.validation import check_X_y, check_is_fitted
 from sklearn.pipeline import Pipeline
 from sklearn.feature_extraction.text import TfidfVectorizer, HashingVectorizer
 
-class toConsole(object):
-    def __init__(self):
-        self.now = datetime.now
-        self.output = '{:%Y/%m/%d %H:%M:%S} [{level}] {msg}'
-
-    def debug(self, msg):
-        print(self.output.format(self.now(), level='DEBUG', msg=msg))
-
-    def info(self, msg):
-        print(self.output.format(self.now(), level='INFO', msg=msg))
-
-    def warning(self, msg):
-        print(self.output.format(self.now(), level='WARNING', msg=msg))
-
-    def error(self, msg):
-        print(self.output.format(self.now(), level='ERROR', msg=msg))
 
 class NBFeaturer(BaseEstimator, ClassifierMixin):
     def __init__(self, alpha=1):
@@ -49,6 +35,7 @@ class NBFeaturer(BaseEstimator, ClassifierMixin):
         return x_nb
 
     def fit(self, x, y):
+        assert set(y) == set([0, 1]), "NBFeaturer only support binary label (0 and 1)"
         self._r = sparse.csr_matrix(np.log(self.pr(x, 1, y) / self.pr(x, 0, y)))
         return self
 
@@ -56,40 +43,50 @@ class NBFeaturer(BaseEstimator, ClassifierMixin):
         p = x[y == y_i].sum(0)
         return (p + self.alpha) / ((y == y_i).sum() + self.alpha)
 
-class NBSVM(object):
+class NBSVM(ClassifierMixin):
     save_obj = ['class_num', 'nb_ratios', 'models']
     logistic_reg_params = {'solver':'lbfgs'}
 
-    def __init__(self, class_num=3, logger=toConsole(), logistic_reg_params={}, n_jobs=1):
+    def __init__(self, logistic_reg_params={}, n_jobs=1, logger=None):
         self.logistic_reg_params.update(logistic_reg_params)
-        self.class_num = class_num
-        self.logger = logger
         self.n_jobs = n_jobs
         self.md5 = None
-        self.nb_ratios = [None] * class_num
-        self.models = [None] * class_num
+        self.logger = logger and logger or logging.getLogger('nbsvm_logger')
+        self.classes_ = None
+        self.nb_ratios = []
+        self.models = []
+        self.class_num = None
+
 
     def __repr__(self):
-        return f'<NBSVM: classes={self.class_num}>'
+        return f'<NBSVM: classes={self.classes_}>'
 
     def _chcek_class_num(self, fit_y):
         assert len(set(fit_y)) == self.class_num, \
                 f'Fitting Target is not compatible with class num={self.class_num}'
 
-    def fit(self, x, y):
+    def _preprocess_x(self, x):
         if not (isspmatrix_csc(x) or isspmatrix_csr(x)):
             x = sparse.csr_matrix(x)
+        return x
+
+    def fit(self, x, y):
+        x = self._preprocess_x(x)
+            
         self.logger.info("Shape of Training Set: {}".format(x.shape))
 
         y = np.array(y) 
-        self._chcek_class_num(y)
+        assert y.ndim == 1, f"Not support multi-label"
+        
+        self.classes_ = np.array(sorted(set(y)))
 
         start = time.time()
         for step, (model, nb_ratio) in enumerate(
             Parallel(n_jobs=self.n_jobs)(delayed(
-            self._get_lr_mdl)(x, (y == idx).astype(int)) for idx in range(self.class_num))):
-            self.models[step] = model
-            self.nb_ratios[step] = nb_ratio
+            self._get_lr_mdl)(x, (y == idx).astype(int)) for idx in self.classes_)):
+
+            self.models.append(model)
+            self.nb_ratios.append(nb_ratio)
 
         self.logger.info(f'Training comsuming time: {time.time() - start:2f} s')
         self.logger.info(f"Train set acc: {self.evaluate(x, y)}")
@@ -109,15 +106,14 @@ class NBSVM(object):
         '''
         x: list of string
         '''
-        preds = self.predict_prob(x)
-        return preds.argmax(axis=1)
+        preds = self.predict_proba(x)
+        return self.classes_[preds.argmax(axis=1)]
 
-    def predict_prob(self, x):
-        if not (isspmatrix_csc(x) or isspmatrix_csr(x)):
-            x = sparse.csr_matrix(x)
+    def predict_proba(self, x):
+        x = self._preprocess_x(x)
 
-        preds = np.zeros((x.shape[0], self.class_num))
-        for idx in range(self.class_num):
+        preds = np.zeros((x.shape[0], self.classes_.shape[0]))
+        for idx in range(self.classes_.shape[0]):
             model, factor = self.models[idx], self.nb_ratios[idx]
             preds[:, idx] = model.predict_proba(x.multiply(factor))[:, 1]
         return preds
